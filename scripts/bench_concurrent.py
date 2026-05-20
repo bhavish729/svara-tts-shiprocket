@@ -63,13 +63,16 @@ async def one_request(
     idx: int,
     max_tokens: Optional[int],
 ) -> Result:
-    payload = {
-        "text": text,
-        "voice": voice,
-        "stream": True,
-    }
+    # The /v1/text-to-speech endpoint accepts JSON in theory but its
+    # `json_body: Optional[TTSRequest] = None` parameter doesn't actually
+    # bind from a JSON body in FastAPI (no Body() annotation). Use multipart
+    # form-data — that path is the one the curl recipes in the repo use.
+    form = aiohttp.FormData()
+    form.add_field("text", text)
+    form.add_field("voice", voice)
+    form.add_field("stream", "true")
     if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+        form.add_field("max_tokens", str(max_tokens))
 
     t0 = time.perf_counter()
     ttfb_s: Optional[float] = None
@@ -78,7 +81,7 @@ async def one_request(
     error: Optional[str] = None
 
     try:
-        async with session.post(url, json=payload) as resp:
+        async with session.post(url, data=form) as resp:
             status = resp.status
             if status != 200:
                 body = await resp.text()
