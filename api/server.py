@@ -5,10 +5,12 @@ Provides ElevenLabs-style text-to-speech endpoints with support for
 Indian language voices and streaming audio generation.
 """
 from __future__ import annotations
+import asyncio
 import os
 import sys
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from uuid import uuid4
@@ -53,6 +55,9 @@ MAX_GENERATION_TOKENS = int(os.getenv("TTS_MAX_TOKENS", str(VLLM_MAX_MODEL_LEN))
 orchestrator: Optional[SvaraTTSOrchestrator] = None
 tokenizer = None  # For zero-shot voice cloning
 voice_clone_cache: Dict[str, Dict[str, Any]] = {}
+# Guards concurrent writes to voice_clone_cache. Reads are dict-atomic on CPython
+# but assignment under load needs serialization to avoid resize races.
+voice_clone_cache_lock = asyncio.Lock()
 
 
 # ============================================================================
@@ -78,20 +83,28 @@ async def lifespan(app: FastAPI):
         device=TTS_DEVICE,
         prebuffer_seconds=0.5,
         concurrent_decode=True,
-        max_workers=2,
+        max_workers=int(os.getenv("TTS_DECODE_WORKERS", "8")),
     )
-    
+
+    # Warmup SNAC kernels so the first request doesn't pay the JIT/compile cost
+    # on the critical TTFB path.
+    t0 = time.perf_counter()
+    orchestrator.codec.warmup()
+    print(f"✓ SNAC warmed up in {(time.perf_counter() - t0) * 1000:.1f}ms")
+
     # Load tokenizer for zero-shot voice cloning
     print(f"📦 Loading tokenizer for {VLLM_MODEL}...")
     tokenizer = AutoTokenizer.from_pretrained(VLLM_MODEL)
     print(f"✓ Tokenizer loaded")
-    
+
     print(f"✓ Orchestrator initialized")
     print(f"✓ Loaded {len(get_all_voices())} voices")
-    
+
     yield
-    
+
     print("🛑 Shutting down Svara TTS API...")
+    if orchestrator is not None:
+        await orchestrator.close()
 
 
 # ============================================================================
@@ -365,6 +378,7 @@ async def text_to_speech(
     
     # Use global orchestrator (already initialized, SNAC model cached)
     request_orchestrator = orchestrator
+    request_id = uuid4().hex
     
     # Build generation kwargs from request parameters
     gen_kwargs = {}
@@ -396,10 +410,12 @@ async def text_to_speech(
         async def audio_stream():
             """Stream audio chunks as they're generated."""
             try:
-                async for chunk in request_orchestrator.astream(request_text, prompt=prompt, **gen_kwargs):
+                async for chunk in request_orchestrator.astream(
+                    request_text, prompt=prompt, request_id=request_id, **gen_kwargs
+                ):
                     yield chunk
             except Exception as e:
-                print(f"Error during streaming: {e}")
+                logger.exception("Error during streaming [request_id=%s]: %s", request_id, e)
                 raise
         
         return StreamingResponse(
@@ -416,7 +432,9 @@ async def text_to_speech(
         # Non-streaming: collect all audio chunks
         try:
             audio_chunks = []
-            async for chunk in request_orchestrator.astream(request_text, prompt=prompt, **gen_kwargs):
+            async for chunk in request_orchestrator.astream(
+                request_text, prompt=prompt, request_id=request_id, **gen_kwargs
+            ):
                 audio_chunks.append(chunk)
             
             complete_audio = b"".join(audio_chunks)
@@ -477,12 +495,13 @@ async def voice_clone_endpoint(
         audio_tensor, input_sample_rate=sample_rate, add_token_offsets=True
     )
     voice_id = uuid4().hex
-    voice_clone_cache[voice_id] = {
-        "audio_tokens": audio_tokens,
-        "reference_transcript": transcript,
-        "sample_rate": sample_rate,
-        "model_id": model_id,
-    }
+    async with voice_clone_cache_lock:
+        voice_clone_cache[voice_id] = {
+            "audio_tokens": audio_tokens,
+            "reference_transcript": transcript,
+            "sample_rate": sample_rate,
+            "model_id": model_id,
+        }
 
     token_preview = audio_tokens[: min(16, len(audio_tokens))]
     response_payload = VoiceCloneResponse(

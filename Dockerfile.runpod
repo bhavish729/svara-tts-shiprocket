@@ -1,0 +1,86 @@
+# Svara TTS — RunPod H100 image
+# Differs from the base Dockerfile:
+#   - CUDA 12.4 base (H100 sm_90, broader vLLM wheel availability than 12.8)
+#   - HF_HOME pinned to /workspace/models so a RunPod Network Volume mounted
+#     there persists weights across pod restarts
+#   - copies supervisord.runpod.conf (H100-tuned vLLM args)
+
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/usr/local/cuda/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}" \
+    HF_HOME=/workspace/models \
+    HUGGINGFACE_HUB_CACHE=/workspace/models \
+    TRANSFORMERS_CACHE=/workspace/models
+
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+        python3.11 \
+        python3.11-dev \
+        python3.11-venv \
+        python3-pip \
+        git \
+        wget \
+        curl \
+        libsndfile1 \
+        supervisor \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /app
+
+# ============================================================================
+# PyTorch with CUDA 12.4 support
+# ============================================================================
+FROM base AS pytorch-builder
+RUN pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu124
+
+# ============================================================================
+# vLLM (uses our pre-installed torch)
+# ============================================================================
+FROM pytorch-builder AS vllm-builder
+ENV MAX_JOBS=4 NVCC_THREADS=4 TORCH_CUDA_ARCH_LIST="9.0"
+RUN pip3 install --no-build-isolation vllm || pip3 install vllm
+
+# ============================================================================
+# App dependencies
+# ============================================================================
+FROM vllm-builder AS app-deps
+COPY requirements.txt .
+RUN pip3 install -r requirements.txt \
+    && pip3 install soundfile numpy
+
+# ============================================================================
+# Final image
+# ============================================================================
+FROM app-deps AS final
+COPY tts_engine/ ./tts_engine/
+COPY api/ ./api/
+COPY scripts/ ./scripts/
+COPY supervisord.runpod.conf /etc/supervisor/conf.d/svara-tts.conf
+
+RUN chmod +x ./scripts/*.sh ./scripts/*.py \
+    && mkdir -p /var/log/supervisor /workspace/models
+
+# Network Volume mount target. The pod's RunPod Volume should be mounted here.
+VOLUME ["/workspace/models"]
+
+# 8000 = vLLM, 8080 = FastAPI
+EXPOSE 8000 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/svara-tts.conf"]

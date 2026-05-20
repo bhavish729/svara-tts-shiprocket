@@ -1,4 +1,8 @@
 # tts_engine/snac_codec.py
+from __future__ import annotations
+import asyncio
+import logging
+import threading
 from snac import SNAC
 from typing import List, Optional
 import numpy as np
@@ -6,34 +10,27 @@ import torch
 from .utils import resample_audio
 from .timing import track_time
 
+logger = logging.getLogger(__name__)
+
 # Global model cache to avoid reloading SNAC model for each instance
 _SNAC_MODEL_CACHE: dict[str, SNAC] = {}
 
 
 def _get_or_load_snac_model(device: str, model_name: str = "hubertsiuzdak/snac_24khz") -> SNAC:
-    """
-    Get cached SNAC model or load it if not cached.
-    
-    This prevents repeated model loading when creating multiple codec instances.
-    Models are cached per device to handle multi-GPU scenarios.
-    
-    Args:
-        device: Device to load model on ('cuda', 'mps', 'cpu')
-        model_name: HuggingFace model identifier
-    
-    Returns:
-        Cached or newly loaded SNAC model
+    """Get cached SNAC model or load it if not cached.
+
+    Models are cached per (model_name, device) so multiple SNACCodec instances
+    share the same nn.Module.
     """
     cache_key = f"{model_name}_{device}"
-    
+
     if cache_key not in _SNAC_MODEL_CACHE:
-        print(f"[DEBUG] Loading SNAC model: {model_name} on device: {device}")
+        logger.info("Loading SNAC model %s on device %s", model_name, device)
         model = SNAC.from_pretrained(model_name).eval().to(device)
-        print(f"[DEBUG] SNAC model loaded. Type: {type(model)}, Config: {model.config if hasattr(model, 'config') else 'N/A'}")
         _SNAC_MODEL_CACHE[cache_key] = model
     else:
-        print(f"[DEBUG] Using cached SNAC model: {cache_key}")
-    
+        logger.debug("Using cached SNAC model: %s", cache_key)
+
     return _SNAC_MODEL_CACHE[cache_key]
 
 
@@ -68,9 +65,19 @@ class SNACCodec:
         self.device = device
         self.model_name = model_name
         self.sample_rate = 24000  # SNAC 24kHz model
-        
+
         # Get or load model from cache
         self.model = _get_or_load_snac_model(device, model_name)
+
+        # Concurrency guard: the SNAC nn.Module is shared across requests but its
+        # forward is not safe to invoke from multiple coroutines simultaneously on
+        # the same default CUDA stream. The lock serializes Python-side entry; the
+        # dedicated CUDA stream keeps SNAC work off vLLM's stream.
+        self._async_lock = asyncio.Lock()
+        self._thread_lock = threading.Lock()
+        self._stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=device) if device == "cuda" else None
+        )
 
     @track_time("SNAC.encode_audio")
     def encode_audio(
@@ -108,30 +115,21 @@ class SNACCodec:
             700
         """
         # Resample to 24kHz if needed
-        if input_sample_rate != self.sample_rate:            
+        if input_sample_rate != self.sample_rate:
             audio = resample_audio(audio, input_sample_rate, self.sample_rate, self.device)
-        
-        # Debug: Check audio after resampling
-        print(f"[DEBUG] Audio shape after resample: {audio.shape}")
-        
+
         # Ensure proper shape: SNAC expects (batch, channels, samples)
         if audio.dim() == 1:
-            # (samples,) -> (1, 1, samples)
             audio = audio.unsqueeze(0).unsqueeze(0)
         elif audio.dim() == 2:
-            # (channels, samples) -> (1, channels, samples)
             audio = audio.unsqueeze(0)
-        
+
         # Move to device and ensure float32
         audio = audio.to(dtype=torch.float32, device=self.device)
-        
-        print(f"[DEBUG] Audio shape going into SNAC encode: {audio.shape}")
-        
+
         # Encode with SNAC
         with torch.inference_mode():
             codes = self.model.encode(audio)
-        
-        print(f"[DEBUG] SNAC codes shapes: codes[0]={codes[0].shape}, codes[1]={codes[1].shape}, codes[2]={codes[2].shape}")
         
         # SNAC produces hierarchical codes with different temporal resolutions:
         # codes[0]: coarsest (e.g., 100 frames for 1 sec)
@@ -180,46 +178,62 @@ class SNACCodec:
     
     @track_time("SNAC.decode_window")
     def decode_window(self, window: List[int]) -> bytes:
+        """Synchronous decode of a sliding window of Svara-TTS codes into PCM16 bytes.
+
+        Window: flat list of raw SNAC codes (no token offsets) in [0, 4096], length
+        multiple of 7. Returns PCM16 mono bytes, or b"" for invalid input.
+
+        Safe to call from multiple threads — protected by a process-wide thread
+        lock and routed to a dedicated CUDA stream so it doesn't interleave with
+        vLLM's default stream.
         """
-        Decode a sliding window of Svara-TTS codes into PCM16 bytes.
-        
-        Args:
-            window: Flat list of int codes, length multiple of 7 (>= 28 recommended).
-                   These should be raw SNAC codes in range [0, 4096], NOT with
-                   token offsets added.
-        
-        Returns:
-            PCM16 mono bytes; empty bytes if invalid input.
-        """
+        with self._thread_lock:
+            return self._decode_window_locked(window)
+
+    async def decode_window_async(self, window: List[int]) -> bytes:
+        """Async wrapper: serialize via asyncio.Lock, run the GPU kernel in a thread."""
+        async with self._async_lock:
+            return await asyncio.to_thread(self._decode_window_locked, window)
+
+    def _decode_window_locked(self, window: List[int]) -> bytes:
         if not window or len(window) < 7:
             return b""
-        
-        # Use only full frames
+
         F = len(window) // 7
         frame = window[: F * 7]
-        
-        # Build code streams: [c0], [c1,c4], [c2,c3,c5,c6]
+
         t = torch.tensor(frame, dtype=torch.int32, device=self.device)
         t = t.view(F, 7)
-        
+
         codes_0 = t[:, 0].reshape(1, -1)
         codes_1 = t[:, [1, 4]].reshape(1, -1)
         codes_2 = t[:, [2, 3, 5, 6]].reshape(1, -1)
-        
-        # Validate range [0, 4096]
+
         if (
-            torch.any((codes_0 < 0) | (codes_0 > 4096)) or
-            torch.any((codes_1 < 0) | (codes_1 > 4096)) or
-            torch.any((codes_2 < 0) | (codes_2 > 4096))
-        ):            
+            torch.any((codes_0 < 0) | (codes_0 > 4096))
+            or torch.any((codes_1 < 0) | (codes_1 > 4096))
+            or torch.any((codes_2 < 0) | (codes_2 > 4096))
+        ):
             return b""
-        
-        with torch.inference_mode():
-            audio = self.model.decode([codes_0, codes_1, codes_2])  # [1, 1, T]
-            # Keep the synthesis region (matches SNAC examples)
-            audio = audio[:, :, 2048:4096]
-        
+
+        if self._stream is not None:
+            with torch.cuda.stream(self._stream), torch.inference_mode():
+                audio = self.model.decode([codes_0, codes_1, codes_2])
+                audio = audio[:, :, 2048:4096]
+            self._stream.synchronize()
+        else:
+            with torch.inference_mode():
+                audio = self.model.decode([codes_0, codes_1, codes_2])
+                audio = audio[:, :, 2048:4096]
+
         x = audio.detach().float().cpu().numpy().reshape(-1)
-        print(x.shape)
         pcm16 = (np.clip(x, -1.0, 1.0) * 32767.0).astype(np.int16)
         return pcm16.tobytes()
+
+    def warmup(self) -> None:
+        """Run one dummy decode to JIT/compile kernels before serving traffic."""
+        dummy = [100] * 28  # valid SNAC code range, four frames
+        self._decode_window_locked(dummy)
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        logger.info("SNAC warmup complete on %s", self.device)
