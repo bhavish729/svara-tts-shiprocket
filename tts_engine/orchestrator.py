@@ -41,6 +41,7 @@ class SvaraTTSOrchestrator:
                  prebuffer_seconds: float = 0.5,
                  concurrent_decode: bool = True,
                  max_workers: int = 2,
+                 pending_threshold: int = 2,
                  device: Optional[str] = None):
         # If speaker_id is provided, use it; otherwise construct from lang_code and gender
         if speaker_id is None:
@@ -63,6 +64,10 @@ class SvaraTTSOrchestrator:
         self.prebuffer_samples = int(self.codec.sample_rate * prebuffer_seconds)
         self.concurrent_decode = concurrent_decode
         self.max_workers = max_workers
+        # How many SNAC windows we let pile up before yielding the next one.
+        # 0 = yield as soon as a single window is decoded (lowest TTFB).
+        # 2 = keep 3 windows in-flight (more pipelining, higher TTFB).
+        self.pending_threshold = pending_threshold
         # Single shared executor for the sync decode path. The async path uses
         # asyncio.to_thread inside SNACCodec.decode_window_async and doesn't
         # touch this executor.
@@ -118,7 +123,7 @@ class SvaraTTSOrchestrator:
                 if win is not None:
                     pending.append(submit(win))
 
-                while len(pending) > 2:
+                while len(pending) > self.pending_threshold:
                     result = audio_buf.process(pending.pop(0).result())
                     if result:
                         yield result
@@ -179,7 +184,7 @@ class SvaraTTSOrchestrator:
                 if win is not None:
                     pending.append(asyncio.create_task(self.codec.decode_window_async(win)))
 
-                while len(pending) > 2:
+                while len(pending) > self.pending_threshold:
                     result = audio_buf.process(await pending.pop(0))
                     if result:
                         yield result

@@ -76,15 +76,19 @@ async def lifespan(app: FastAPI):
     
     # Initialize orchestrator with default settings
     # We'll create new instances per request with specific voice settings
+    prebuffer_seconds = float(os.getenv("TTS_PREBUFFER_SECONDS", "0.5"))
+    pending_threshold = int(os.getenv("TTS_PENDING_THRESHOLD", "2"))
     orchestrator = SvaraTTSOrchestrator(
         base_url=VLLM_BASE_URL,
         model=VLLM_MODEL,
         speaker_id="English (Male)",  # Default, will be overridden per request
         device=TTS_DEVICE,
-        prebuffer_seconds=0.5,
+        prebuffer_seconds=prebuffer_seconds,
         concurrent_decode=True,
         max_workers=int(os.getenv("TTS_DECODE_WORKERS", "8")),
+        pending_threshold=pending_threshold,
     )
+    print(f"   prebuffer_seconds={prebuffer_seconds}  pending_threshold={pending_threshold}")
 
     # Warmup SNAC kernels so the first request doesn't pay the JIT/compile cost
     # on the critical TTFB path.
