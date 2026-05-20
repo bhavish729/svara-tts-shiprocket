@@ -74,6 +74,17 @@ COPY supervisord.runpod.conf /etc/supervisor/conf.d/svara-tts.conf
 RUN chmod +x ./scripts/*.sh ./scripts/*.py \
     && mkdir -p /var/log/supervisor /workspace/models
 
+# Register the cu13 NVRTC libs (shipped inside the torch+cu130 pip dist) with
+# the dynamic linker. Without this, SNAC's snake activation triggers torch's
+# JIT kernel fuser which calls into NVRTC and fails with:
+#   nvrtc: error: failed to open libnvrtc-builtins.so.13.0
+# We saw this in production on the RunPod H100 image during SNAC warmup.
+RUN echo "/usr/local/lib/python3.11/dist-packages/nvidia/cu13/lib" \
+        > /etc/ld.so.conf.d/cu13-nvrtc.conf \
+    && echo "/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib" \
+        >> /etc/ld.so.conf.d/cu13-nvrtc.conf \
+    && ldconfig
+
 # Network Volume mount target. The pod's RunPod Volume should be mounted here.
 VOLUME ["/workspace/models"]
 
